@@ -1,6 +1,6 @@
 The `Dockerfile` supports building and cross compiling docker daemon and extra
 tools using [Docker Buildx](https://github.com/docker/buildx) and [BuildKit](https://github.com/moby/buildkit).
-A [bake definition](https://docs.docker.com/build/bake/file-definition/) named
+A [bake definition](https://docs.docker.com/build/bake/) named
 `docker-bake.hcl` is in place to ease the build process:
 
 ```shell
