@@ -1,7 +1,6 @@
 package storagebackend
 
 import (
-	"context"
 	"errors"
 	"testing"
 
@@ -98,30 +97,6 @@ func TestRouterGetLayerMountIDUsesContainerDriver(t *testing.T) {
 	assert.Check(t, is.DeepEqual(legacyBackend.getMountIDCalls, []string{"old"}))
 }
 
-func TestRouterResolveImageIDUsesContainerDriver(t *testing.T) {
-	defaultBackend := &fakeBackend{
-		id:       "overlayfs",
-		imageIDs: map[string]string{"alpine": "sha256:new"},
-	}
-	legacyBackend := &fakeBackend{
-		id:       "overlay2",
-		imageIDs: map[string]string{"alpine": "sha256:old"},
-	}
-
-	router, err := NewRouter(defaultBackend)
-	assert.NilError(t, err)
-	assert.NilError(t, router.RegisterLegacy(legacyBackend))
-
-	imageID, err := router.ResolveImageID(context.Background(), &ContainerRef{
-		ID:     "old",
-		Driver: "overlay2",
-	}, "alpine")
-	assert.NilError(t, err)
-	assert.Check(t, is.Equal(imageID, "sha256:old"))
-	assert.Check(t, is.DeepEqual(defaultBackend.resolveImageCalls, []string(nil)))
-	assert.Check(t, is.DeepEqual(legacyBackend.resolveImageCalls, []string{"alpine"}))
-}
-
 func TestRouterCleanupCleansAllBackends(t *testing.T) {
 	defaultBackend := &fakeBackend{id: "overlayfs"}
 	legacyBackend := &fakeBackend{id: "overlay2"}
@@ -144,14 +119,12 @@ func TestRouterRejectsDuplicateBackend(t *testing.T) {
 }
 
 type fakeBackend struct {
-	id                BackendID
-	layers            map[string]RWLayer
-	imageIDs          map[string]string
-	getLayerCalls     []string
-	getMountIDCalls   []string
-	resolveImageCalls []string
-	releaseCalls      int
-	cleanupCalls      int
+	id              BackendID
+	layers          map[string]RWLayer
+	getLayerCalls   []string
+	getMountIDCalls []string
+	releaseCalls    int
+	cleanupCalls    int
 }
 
 func (b *fakeBackend) BackendID() BackendID {
@@ -175,15 +148,6 @@ func (b *fakeBackend) ReleaseLayer(RWLayer) error {
 func (b *fakeBackend) GetLayerMountID(containerID string) (string, error) {
 	b.getMountIDCalls = append(b.getMountIDCalls, containerID)
 	return containerID + "-mount", nil
-}
-
-func (b *fakeBackend) ResolveImageID(_ context.Context, refOrID string) (string, error) {
-	b.resolveImageCalls = append(b.resolveImageCalls, refOrID)
-	imageID, ok := b.imageIDs[refOrID]
-	if !ok {
-		return "", errors.New("image not found")
-	}
-	return imageID, nil
 }
 
 func (b *fakeBackend) Cleanup() error {

@@ -316,8 +316,10 @@ daemon/delete.go
 
 接入点包括：
 
+- 仅在显式开启 `features.legacy-storage-backend-compat=true` 时启用兼容模式；默认保持上游现有单 backend restore 行为。
 - daemon 启动时创建 `storageRouter`，default backend 包装当前 `daemon.imageService`。
-- 如果磁盘上存在非当前 driver 的容器，尝试按该 driver 初始化 legacy graphdriver `layer.Store`，并加载对应的只读 `imageStore/referenceStore` 用于 legacy image ref 解析。
+- 如果磁盘上存在非当前 driver 的容器，尝试按该 driver 初始化 legacy graphdriver `layer.Store`。
+- daemon 同时创建独立的 `ContainerImageIdentityResolver`，用于只读解析 legacy 容器创建时记录的 image ref。
 - restore 阶段不再只恢复当前 driver 分组的容器，而是恢复所有已加载容器，并通过 router 按 `container.Driver` 恢复 RW layer。
 - `docker rm` 释放 RW layer 时通过 router 路由，避免旧容器误调用当前 default backend 的 `ReleaseLayer`。
 
@@ -375,7 +377,7 @@ for _, c := range loadedContainers {
 
 需要特别注意 `docker ps` 的 `IMAGE` 字段。现有 `refreshImage()` 会用全局 `daemon.imageService.GetImage(ctx, s.Image, ...)` 判断容器创建时的 image ref 是否仍指向原 `ImageID`。切换 backend 后，legacy 容器引用的 image ref 可能只存在于旧 backend 的 image store 中，当前 default image store 查不到它，于是 `refreshImage()` 会把 `IMAGE` 回退成镜像 ID。
 
-demo 当前处理是：`refreshImage()` 不再直接调用全局 default `imageService`，而是通过 storage router 按容器所属 backend 解析 image ref。legacy graphdriver backend 会加载旧 driver 目录下的 `image/<driver>/imagedb` 和 `image/<driver>/repositories.json`，只读解析 ref 是否仍指向容器创建时记录的 `ImageID`。如果 legacy resolver 也无法解析，才回退成 image ID。
+demo 当前处理是：`refreshImage()` 不再直接调用全局 default `imageService`，而是通过独立的 `ContainerImageIdentityResolver` 按容器所属 backend 解析 image ref。legacy graphdriver resolver 只读读取旧 driver 目录下的 `image/<driver>/repositories.json` 和 `image/<driver>/imagedb/content/sha256`，不调用 `image.NewImageStore()`，也不 retain 旧 layer。它只校验 ref 是否仍指向容器创建时记录的 `ImageID`。如果 legacy resolver 也无法解析，才回退成 image ID。
 
 这解决了 `docker ps` 的 `IMAGE` 展示问题，但仍不是完整 multi image store。后续如果要支持 `ancestor` filter、`image inspect` 或只读 legacy image 展示，需要把 read-only image reference resolver 扩展成更完整的 backend-aware image inventory API。
 
@@ -784,7 +786,8 @@ docker -H "unix://$SOCK" inspect old-overlay2 --format '{{.Driver}}'
 cat > "$CFG" <<EOF
 {
   "features": {
-    "containerd-snapshotter": true
+    "containerd-snapshotter": true,
+    "legacy-storage-backend-compat": true
   }
 }
 EOF
@@ -805,6 +808,7 @@ daemon 日志应出现类似信息：
 
 ```text
 registered legacy storage backend for previously-created containers
+registered legacy image identity resolver for previously-created containers
 ```
 
 3. 验证旧容器仍可见、可启动、可删除：

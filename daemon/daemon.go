@@ -106,6 +106,7 @@ type Daemon struct {
 	execCommands      *container.ExecStore
 	imageService      ImageService
 	storageRouter     *storagebackend.Router
+	imageIdentity     *containerImageIdentityResolver
 	configStore       atomic.Pointer[configStore]
 	configReload      sync.Mutex
 	statsCollector    *stats.Collector
@@ -1354,10 +1355,29 @@ func NewDaemon(ctx context.Context, config *config.Config, pluginStore *plugin.S
 		return nil, errors.New("driverName is empty. Please report it as a bug! As a workaround, please set the storage driver explicitly")
 	}
 
-	if err := d.initStorageRouter(ctx, cfgStore, containers, driverName); err != nil {
-		return nil, err
+	driverContainers := containers[driverName]
+	if legacyStorageBackendCompatEnabled(cfgStore) {
+		log.G(ctx).WithField("feature", legacyStorageBackendCompatFeature).Info("legacy storage backend compatibility is enabled")
+		if err := d.initStorageRouter(ctx, cfgStore, containers, driverName); err != nil {
+			return nil, err
+		}
+		d.initContainerImageIdentityResolver(ctx, cfgStore, containers, driverName)
+		driverContainers = flattenContainerGroups(containers)
+	} else if len(containers) > 0 {
+		for driver, all := range containers {
+			if driver == driverName {
+				continue
+			}
+			for id := range all {
+				log.G(ctx).WithFields(log.Fields{
+					"container":      id,
+					"driver":         driver,
+					"current_driver": driverName,
+				}).Debugf("not restoring container because it was created with another storage driver (%s)", driver)
+			}
+		}
 	}
-	if err := d.restore(ctx, cfgStore, flattenContainerGroups(containers)); err != nil {
+	if err := d.restore(ctx, cfgStore, driverContainers); err != nil {
 		return nil, err
 	}
 	// Wait for migration to complete

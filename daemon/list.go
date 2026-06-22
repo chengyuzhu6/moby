@@ -636,7 +636,7 @@ func (daemon *Daemon) refreshImage(ctx context.Context, s *container.Snapshot) *
 
 	// Also update the image to the specific image ID, if the Image now
 	// resolves to a different ID.
-	if imageID != s.ImageID {
+	if imageID.String() != s.ImageID {
 		c.Image = s.ImageID
 	}
 
