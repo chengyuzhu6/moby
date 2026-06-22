@@ -82,6 +82,7 @@ import (
 	"github.com/moby/moby/v2/daemon/server/backend"
 	"github.com/moby/moby/v2/daemon/snapshotter"
 	"github.com/moby/moby/v2/daemon/stats"
+	"github.com/moby/moby/v2/daemon/storagebackend"
 	volumesservice "github.com/moby/moby/v2/daemon/volume/service"
 	"github.com/moby/moby/v2/dockerversion"
 	"github.com/moby/moby/v2/pkg/authorization"
@@ -104,6 +105,7 @@ type Daemon struct {
 	containersReplica *container.ViewDB
 	execCommands      *container.ExecStore
 	imageService      ImageService
+	storageRouter     *storagebackend.Router
 	configStore       atomic.Pointer[configStore]
 	configReload      sync.Mutex
 	statsCollector    *stats.Collector
@@ -301,7 +303,7 @@ func (daemon *Daemon) restore(ctx context.Context, cfg *configStore, containers 
 
 			logger := log.G(ctx).WithField("container", c.ID)
 
-			rwlayer, err := daemon.imageService.GetLayerByID(c.ID)
+			rwlayer, err := daemon.getContainerRWLayer(c)
 			if err != nil {
 				// A container without a rwlayer is in a bad state, but we must register that container to let users
 				// remove it. So, log the error but do not early-return.
@@ -1352,23 +1354,10 @@ func NewDaemon(ctx context.Context, config *config.Config, pluginStore *plugin.S
 		return nil, errors.New("driverName is empty. Please report it as a bug! As a workaround, please set the storage driver explicitly")
 	}
 
-	driverContainers, ok := containers[driverName]
-	// Log containers which are not loaded with current driver
-	if (!ok && len(containers) > 0) || len(containers) > 1 {
-		for driver, all := range containers {
-			if driver == driverName {
-				continue
-			}
-			for id := range all {
-				log.G(ctx).WithFields(log.Fields{
-					"container":      id,
-					"driver":         driver,
-					"current_driver": driverName,
-				}).Debugf("not restoring container because it was created with another storage driver (%s)", driver)
-			}
-		}
+	if err := d.initStorageRouter(ctx, cfgStore, containers, driverName); err != nil {
+		return nil, err
 	}
-	if err := d.restore(ctx, cfgStore, driverContainers); err != nil {
+	if err := d.restore(ctx, cfgStore, flattenContainerGroups(containers)); err != nil {
 		return nil, err
 	}
 	// Wait for migration to complete
@@ -1519,7 +1508,7 @@ func (daemon *Daemon) Shutdown(ctx context.Context) error {
 				logger.WithError(err).Error("failed to shut down container")
 				return
 			}
-			if mountid, err := daemon.imageService.GetLayerMountID(c.ID); err == nil {
+			if mountid, err := daemon.getContainerLayerMountID(c); err == nil {
 				daemon.cleanupMountsByID(mountid)
 			}
 			logger.Debugf("shut down container")
@@ -1533,7 +1522,7 @@ func (daemon *Daemon) Shutdown(ctx context.Context) error {
 	}
 
 	if daemon.imageService != nil {
-		if err := daemon.imageService.Cleanup(); err != nil {
+		if err := daemon.cleanupStorageBackends(); err != nil {
 			log.G(ctx).Error(err)
 		}
 	}

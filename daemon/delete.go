@@ -139,7 +139,7 @@ func (daemon *Daemon) cleanupContainer(ctr *container.Container, config backend.
 	// When container creation fails and `RWLayer` has not been created yet, we
 	// do not call `ReleaseRWLayer`
 	if rwLayer != nil {
-		if err := daemon.imageService.ReleaseLayer(rwLayer); err != nil {
+		if err := daemon.releaseContainerRWLayer(ctr, rwLayer); err != nil {
 			// Restore the reference on error as it possibly was not released.
 			ctr.Lock()
 			ctr.RWLayer = rwLayer
