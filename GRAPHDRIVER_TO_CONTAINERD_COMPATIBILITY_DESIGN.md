@@ -317,14 +317,16 @@ daemon/delete.go
 接入点包括：
 
 - daemon 启动时创建 `storageRouter`，default backend 包装当前 `daemon.imageService`。
-- 如果磁盘上存在非当前 driver 的容器，尝试按该 driver 初始化 legacy graphdriver `layer.Store` 并注册为 legacy backend。
+- 如果磁盘上存在非当前 driver 的容器，尝试按该 driver 初始化 legacy graphdriver `layer.Store`，并加载对应的只读 `imageStore/referenceStore` 用于 legacy image ref 解析。
 - restore 阶段不再只恢复当前 driver 分组的容器，而是恢复所有已加载容器，并通过 router 按 `container.Driver` 恢复 RW layer。
 - `docker rm` 释放 RW layer 时通过 router 路由，避免旧容器误调用当前 default backend 的 `ReleaseLayer`。
 
 当前 demo 的端到端范围是：
 
 - 支持 stopped graphdriver legacy 容器在切换到 containerd image store 后继续被 `ps/inspect/start/stop/rm` 管理。
+- `docker ps` 展示 legacy 容器时，会通过容器所属 legacy backend 的只读 image resolver 校验 image ref，避免用当前 default image store 查找失败后误退化成 image ID。
 - 不改变新建容器、pull、build、load 的 backend 选择；这些仍由当前 default `ImageService` 负责。
+- 当前没有实现完整 legacy image store 聚合；`docker images`、`docker image inspect`、`docker ps --filter ancestor=...` 等镜像视图和镜像过滤仍主要使用当前 default image store。
 - legacy backend 初始化失败时，daemon 会继续启动并记录 warning；容器仍会被加载，但没有 RWLayer 的容器无法正常 start。这是 demo 行为，正式方案应在 fail-fast 和 degraded mode 之间做显式配置选择。
 - 反向方向（containerd snapshotter legacy -> graphdriver default）以及 snapshotter -> snapshotter 切换尚未接入 legacy backend 初始化。
 
@@ -370,6 +372,12 @@ for _, c := range loadedContainers {
 ### ImageService 与兼容层边界
 
 上游 master 已有统一的 `daemon.ImageService` interface，但这个 interface 应继续代表 default image management backend。为了和社区后续 containerd image store 方向保持一致，第一阶段不应把它改造成完整的 multi-store aggregator。
+
+需要特别注意 `docker ps` 的 `IMAGE` 字段。现有 `refreshImage()` 会用全局 `daemon.imageService.GetImage(ctx, s.Image, ...)` 判断容器创建时的 image ref 是否仍指向原 `ImageID`。切换 backend 后，legacy 容器引用的 image ref 可能只存在于旧 backend 的 image store 中，当前 default image store 查不到它，于是 `refreshImage()` 会把 `IMAGE` 回退成镜像 ID。
+
+demo 当前处理是：`refreshImage()` 不再直接调用全局 default `imageService`，而是通过 storage router 按容器所属 backend 解析 image ref。legacy graphdriver backend 会加载旧 driver 目录下的 `image/<driver>/imagedb` 和 `image/<driver>/repositories.json`，只读解析 ref 是否仍指向容器创建时记录的 `ImageID`。如果 legacy resolver 也无法解析，才回退成 image ID。
+
+这解决了 `docker ps` 的 `IMAGE` 展示问题，但仍不是完整 multi image store。后续如果要支持 `ancestor` filter、`image inspect` 或只读 legacy image 展示，需要把 read-only image reference resolver 扩展成更完整的 backend-aware image inventory API。
 
 更可控的分阶段方式是：
 

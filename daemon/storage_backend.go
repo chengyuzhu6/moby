@@ -4,10 +4,16 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/containerd/log"
+	"github.com/distribution/reference"
 	"github.com/moby/moby/v2/daemon/container"
+	"github.com/moby/moby/v2/daemon/images"
+	imageStore "github.com/moby/moby/v2/daemon/internal/image"
 	"github.com/moby/moby/v2/daemon/internal/layer"
+	refStore "github.com/moby/moby/v2/daemon/internal/refstore"
+	"github.com/moby/moby/v2/daemon/server/imagebackend"
 	"github.com/moby/moby/v2/daemon/storagebackend"
 	"github.com/pkg/errors"
 )
@@ -38,9 +44,35 @@ func (daemon *Daemon) initStorageRouter(ctx context.Context, cfg *configStore, c
 			continue
 		}
 
+		var legacyImageStore imageStore.Store
+		var referenceStore refStore.Store
+		imageRoot := filepath.Join(cfg.Root, "image", driver)
+		ifs, err := imageStore.NewFSStoreBackend(filepath.Join(imageRoot, "imagedb"))
+		if err != nil {
+			log.G(ctx).WithFields(log.Fields{
+				"driver":    driver,
+				"container": len(driverContainers),
+				"error":     err,
+			}).Warn("legacy image store is not available; containers using it may show image IDs")
+		} else if legacyImageStore, err = imageStore.NewImageStore(ifs, layerStore); err != nil {
+			log.G(ctx).WithFields(log.Fields{
+				"driver":    driver,
+				"container": len(driverContainers),
+				"error":     err,
+			}).Warn("legacy image store is not available; containers using it may show image IDs")
+		} else if referenceStore, err = refStore.NewReferenceStore(filepath.Join(imageRoot, "repositories.json")); err != nil {
+			log.G(ctx).WithFields(log.Fields{
+				"driver":    driver,
+				"container": len(driverContainers),
+				"error":     err,
+			}).Warn("legacy reference store is not available; containers using it may show image IDs")
+		}
+
 		backend := graphdriverStorageBackend{
-			driverName: driver,
-			layerStore: layerStore,
+			driverName:     driver,
+			layerStore:     layerStore,
+			imageStore:     legacyImageStore,
+			referenceStore: referenceStore,
 		}
 		if err := router.RegisterLegacy(backend); err != nil {
 			return err
@@ -107,6 +139,37 @@ func (daemon *Daemon) cleanupStorageBackends() error {
 	return daemon.storageRouter.Cleanup()
 }
 
+func (daemon *Daemon) resolveContainerImageID(ctx context.Context, containerID, refOrID string) (string, error) {
+	if daemon.storageRouter == nil || daemon.containers == nil {
+		img, err := daemon.imageService.GetImage(ctx, refOrID, imagebackend.GetImageOpts{})
+		if err != nil {
+			return "", err
+		}
+		return img.ImageID(), nil
+	}
+	ctr := daemon.containers.Get(containerID)
+	if ctr == nil {
+		img, err := daemon.imageService.GetImage(ctx, refOrID, imagebackend.GetImageOpts{})
+		if err != nil {
+			return "", err
+		}
+		return img.ImageID(), nil
+	}
+	imageID, err := daemon.storageRouter.ResolveImageID(ctx, &storagebackend.ContainerRef{
+		ID:     ctr.ID,
+		Driver: ctr.Driver,
+	}, refOrID)
+	if err == nil {
+		log.G(ctx).WithFields(log.Fields{
+			"container": ctr.ID,
+			"driver":    ctr.Driver,
+			"image":     refOrID,
+			"imageID":   imageID,
+		}).Debug("resolved container image through storage backend")
+	}
+	return imageID, err
+}
+
 type imageServiceStorageBackend struct {
 	imageService ImageService
 }
@@ -127,13 +190,23 @@ func (b imageServiceStorageBackend) GetLayerMountID(containerID string) (string,
 	return b.imageService.GetLayerMountID(containerID)
 }
 
+func (b imageServiceStorageBackend) ResolveImageID(ctx context.Context, refOrID string) (string, error) {
+	img, err := b.imageService.GetImage(ctx, refOrID, imagebackend.GetImageOpts{})
+	if err != nil {
+		return "", err
+	}
+	return img.ImageID(), nil
+}
+
 func (b imageServiceStorageBackend) Cleanup() error {
 	return b.imageService.Cleanup()
 }
 
 type graphdriverStorageBackend struct {
-	driverName string
-	layerStore layer.Store
+	driverName     string
+	layerStore     layer.Store
+	imageStore     imageStore.Store
+	referenceStore refStore.Store
 }
 
 func (b graphdriverStorageBackend) BackendID() storagebackend.BackendID {
@@ -162,6 +235,46 @@ func (b graphdriverStorageBackend) ReleaseLayer(rwLayer storagebackend.RWLayer) 
 
 func (b graphdriverStorageBackend) GetLayerMountID(containerID string) (string, error) {
 	return b.layerStore.GetMountID(containerID)
+}
+
+func (b graphdriverStorageBackend) ResolveImageID(_ context.Context, refOrID string) (string, error) {
+	ref, err := reference.ParseAnyReference(refOrID)
+	if err != nil {
+		return "", err
+	}
+	if b.imageStore == nil {
+		return "", images.ErrImageDoesNotExist{Ref: ref}
+	}
+	namedRef, ok := ref.(reference.Named)
+	if !ok {
+		digested, ok := ref.(reference.Digested)
+		if !ok {
+			return "", images.ErrImageDoesNotExist{Ref: ref}
+		}
+		img, err := b.imageStore.Get(imageStore.ID(digested.Digest()))
+		if err != nil {
+			return "", images.ErrImageDoesNotExist{Ref: ref}
+		}
+		return img.ImageID(), nil
+	}
+
+	if b.referenceStore != nil {
+		if dgst, err := b.referenceStore.Get(namedRef); err == nil {
+			if img, err := b.imageStore.Get(imageStore.ID(dgst)); err == nil {
+				return img.ImageID(), nil
+			}
+		}
+	}
+
+	if id, err := b.imageStore.Search(refOrID); err == nil {
+		img, err := b.imageStore.Get(id)
+		if err != nil {
+			return "", images.ErrImageDoesNotExist{Ref: ref}
+		}
+		return img.ImageID(), nil
+	}
+
+	return "", images.ErrImageDoesNotExist{Ref: ref}
 }
 
 func (b graphdriverStorageBackend) Cleanup() error {

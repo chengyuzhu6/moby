@@ -617,7 +617,7 @@ func (daemon *Daemon) refreshImage(ctx context.Context, s *container.Snapshot) *
 	}
 
 	// Check if the image reference still resolves to the same digest.
-	img, err := daemon.imageService.GetImage(ctx, s.Image, imagebackend.GetImageOpts{})
+	imageID, err := daemon.resolveContainerImageID(ctx, s.ID, s.Image)
 	// If the image is no longer found or can't be resolved for some other
 	// reason. Update the Image to the specific ID of the original image it
 	// resolved to when the container was created.
@@ -636,7 +636,7 @@ func (daemon *Daemon) refreshImage(ctx context.Context, s *container.Snapshot) *
 
 	// Also update the image to the specific image ID, if the Image now
 	// resolves to a different ID.
-	if img.ImageID() != s.ImageID {
+	if imageID != s.ImageID {
 		c.Image = s.ImageID
 	}
 

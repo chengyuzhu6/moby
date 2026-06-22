@@ -1,6 +1,7 @@
 package storagebackend
 
 import (
+	"context"
 	"errors"
 	"fmt"
 )
@@ -41,6 +42,7 @@ type ContainerStorageBackend interface {
 	GetLayerByID(containerID string) (RWLayer, error)
 	ReleaseLayer(RWLayer) error
 	GetLayerMountID(containerID string) (string, error)
+	ResolveImageID(ctx context.Context, refOrID string) (string, error)
 	Cleanup() error
 }
 
@@ -148,6 +150,15 @@ func (r *Router) GetLayerMountID(ctr *ContainerRef) (string, error) {
 		return "", err
 	}
 	return backend.GetLayerMountID(ctr.ID)
+}
+
+// ResolveImageID resolves an image reference through the container's backend.
+func (r *Router) ResolveImageID(ctx context.Context, ctr *ContainerRef, refOrID string) (string, error) {
+	backend, err := r.BackendForContainer(ctr)
+	if err != nil {
+		return "", err
+	}
+	return backend.ResolveImageID(ctx, refOrID)
 }
 
 // Cleanup releases resources for every registered storage backend.
