@@ -45,7 +45,7 @@ func (r *containerImageIdentityResolver) backendForContainer(ctr *container.Cont
 	if ctr == nil || ctr.Driver == "" {
 		return r.defaultBackend
 	}
-	backend, ok := r.backends[storagebackend.BackendID(ctr.Driver)]
+	backend, ok := r.backends[storagebackend.NewGraphDriverBackendID(ctr.Driver)]
 	if !ok {
 		return r.defaultBackend
 	}
@@ -57,7 +57,10 @@ func (r *containerImageIdentityResolver) Resolve(ctx context.Context, ctr *conta
 }
 
 func (daemon *Daemon) initContainerImageIdentityResolver(ctx context.Context, cfg *configStore, containers map[string]map[string]*container.Container, currentDriver string) {
-	resolver := newContainerImageIdentityResolver(imageServiceIdentityBackend{imageService: daemon.imageService})
+	resolver := newContainerImageIdentityResolver(imageServiceIdentityBackend{
+		id:           daemon.currentStorageBackendID(currentDriver),
+		imageService: daemon.imageService,
+	})
 
 	for driver, driverContainers := range containers {
 		if driver == "" || driver == currentDriver || len(driverContainers) == 0 {
@@ -106,11 +109,15 @@ func (daemon *Daemon) resolveContainerImageID(ctx context.Context, containerID, 
 }
 
 type imageServiceIdentityBackend struct {
+	id           storagebackend.BackendID
 	imageService ImageService
 }
 
 func (b imageServiceIdentityBackend) BackendID() storagebackend.BackendID {
-	return storagebackend.BackendID(b.imageService.StorageDriver())
+	if b.id.Valid() {
+		return b.id
+	}
+	return storagebackend.NewGraphDriverBackendID(b.imageService.StorageDriver())
 }
 
 func (b imageServiceIdentityBackend) ResolveImageID(ctx context.Context, refOrID string) (image.ID, error) {
@@ -144,7 +151,7 @@ func newLegacyGraphdriverImageIdentityBackend(driverName, imageRoot string) (*le
 }
 
 func (b *legacyGraphdriverImageIdentityBackend) BackendID() storagebackend.BackendID {
-	return storagebackend.BackendID(b.driverName)
+	return storagebackend.NewGraphDriverBackendID(b.driverName)
 }
 
 func (b *legacyGraphdriverImageIdentityBackend) ResolveImageID(_ context.Context, refOrID string) (image.ID, error) {

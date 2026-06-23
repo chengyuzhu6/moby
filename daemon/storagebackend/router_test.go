@@ -11,12 +11,12 @@ import (
 func TestRouterRestoreLayerUsesContainerDriver(t *testing.T) {
 	defaultLayer := fakeRWLayer{name: "default-layer"}
 	defaultBackend := &fakeBackend{
-		id:     "overlayfs",
+		id:     NewContainerdSnapshotterBackendID("overlayfs"),
 		layers: map[string]RWLayer{"new": defaultLayer},
 	}
 	legacyLayer := fakeRWLayer{name: "legacy-layer"}
 	legacyBackend := &fakeBackend{
-		id:     "overlay2",
+		id:     NewGraphDriverBackendID("overlay2"),
 		layers: map[string]RWLayer{"old": legacyLayer},
 	}
 
@@ -24,11 +24,11 @@ func TestRouterRestoreLayerUsesContainerDriver(t *testing.T) {
 	assert.NilError(t, err)
 	assert.NilError(t, router.RegisterLegacy(legacyBackend))
 
-	newCtr := &ContainerRef{ID: "new", Driver: "overlayfs"}
+	newCtr := &ContainerRef{ID: "new", BackendID: NewContainerdSnapshotterBackendID("overlayfs")}
 	assert.NilError(t, router.RestoreLayer(newCtr))
 	assert.Check(t, is.Equal(newCtr.RWLayer, defaultLayer))
 
-	oldCtr := &ContainerRef{ID: "old", Driver: "overlay2"}
+	oldCtr := &ContainerRef{ID: "old", BackendID: NewGraphDriverBackendID("overlay2")}
 	assert.NilError(t, router.RestoreLayer(oldCtr))
 	assert.Check(t, is.Equal(oldCtr.RWLayer, legacyLayer))
 
@@ -39,7 +39,7 @@ func TestRouterRestoreLayerUsesContainerDriver(t *testing.T) {
 func TestRouterRestoreLayerFallsBackToDefaultForEmptyDriver(t *testing.T) {
 	layer := fakeRWLayer{name: "default-layer"}
 	backend := &fakeBackend{
-		id:     "overlayfs",
+		id:     NewContainerdSnapshotterBackendID("overlayfs"),
 		layers: map[string]RWLayer{"ctr": layer},
 	}
 
@@ -53,25 +53,25 @@ func TestRouterRestoreLayerFallsBackToDefaultForEmptyDriver(t *testing.T) {
 }
 
 func TestRouterRestoreLayerRejectsUnknownBackend(t *testing.T) {
-	router, err := NewRouter(&fakeBackend{id: "overlayfs"})
+	router, err := NewRouter(&fakeBackend{id: NewContainerdSnapshotterBackendID("overlayfs")})
 	assert.NilError(t, err)
 
-	err = router.RestoreLayer(&ContainerRef{ID: "old", Driver: "overlay2"})
-	assert.ErrorContains(t, err, `storage backend "overlay2"`)
+	err = router.RestoreLayer(&ContainerRef{ID: "old", BackendID: NewGraphDriverBackendID("overlay2")})
+	assert.ErrorContains(t, err, `storage backend "graphdriver:overlay2"`)
 }
 
 func TestRouterReleaseLayerUsesContainerDriver(t *testing.T) {
-	defaultBackend := &fakeBackend{id: "overlayfs"}
-	legacyBackend := &fakeBackend{id: "overlay2"}
+	defaultBackend := &fakeBackend{id: NewContainerdSnapshotterBackendID("overlayfs")}
+	legacyBackend := &fakeBackend{id: NewGraphDriverBackendID("overlay2")}
 
 	router, err := NewRouter(defaultBackend)
 	assert.NilError(t, err)
 	assert.NilError(t, router.RegisterLegacy(legacyBackend))
 
 	oldCtr := &ContainerRef{
-		ID:      "old",
-		Driver:  "overlay2",
-		RWLayer: fakeRWLayer{name: "legacy-layer"},
+		ID:        "old",
+		BackendID: NewGraphDriverBackendID("overlay2"),
+		RWLayer:   fakeRWLayer{name: "legacy-layer"},
 	}
 	assert.NilError(t, router.ReleaseLayer(oldCtr))
 
@@ -80,16 +80,16 @@ func TestRouterReleaseLayerUsesContainerDriver(t *testing.T) {
 }
 
 func TestRouterGetLayerMountIDUsesContainerDriver(t *testing.T) {
-	defaultBackend := &fakeBackend{id: "overlayfs"}
-	legacyBackend := &fakeBackend{id: "overlay2"}
+	defaultBackend := &fakeBackend{id: NewContainerdSnapshotterBackendID("overlayfs")}
+	legacyBackend := &fakeBackend{id: NewGraphDriverBackendID("overlay2")}
 
 	router, err := NewRouter(defaultBackend)
 	assert.NilError(t, err)
 	assert.NilError(t, router.RegisterLegacy(legacyBackend))
 
 	mountID, err := router.GetLayerMountID(&ContainerRef{
-		ID:     "old",
-		Driver: "overlay2",
+		ID:        "old",
+		BackendID: NewGraphDriverBackendID("overlay2"),
 	})
 	assert.NilError(t, err)
 	assert.Check(t, is.Equal(mountID, "old-mount"))
@@ -98,8 +98,8 @@ func TestRouterGetLayerMountIDUsesContainerDriver(t *testing.T) {
 }
 
 func TestRouterCleanupCleansAllBackends(t *testing.T) {
-	defaultBackend := &fakeBackend{id: "overlayfs"}
-	legacyBackend := &fakeBackend{id: "overlay2"}
+	defaultBackend := &fakeBackend{id: NewContainerdSnapshotterBackendID("overlayfs")}
+	legacyBackend := &fakeBackend{id: NewGraphDriverBackendID("overlay2")}
 
 	router, err := NewRouter(defaultBackend)
 	assert.NilError(t, err)
@@ -111,11 +111,34 @@ func TestRouterCleanupCleansAllBackends(t *testing.T) {
 }
 
 func TestRouterRejectsDuplicateBackend(t *testing.T) {
-	router, err := NewRouter(&fakeBackend{id: "overlayfs"})
+	router, err := NewRouter(&fakeBackend{id: NewContainerdSnapshotterBackendID("overlayfs")})
 	assert.NilError(t, err)
 
-	err = router.RegisterLegacy(&fakeBackend{id: "overlayfs"})
+	err = router.RegisterLegacy(&fakeBackend{id: NewContainerdSnapshotterBackendID("overlayfs")})
 	assert.ErrorContains(t, err, "already registered")
+}
+
+func TestRouterAllowsSameBackendNameWithDifferentKinds(t *testing.T) {
+	defaultBackend := &fakeBackend{
+		id:     NewContainerdSnapshotterBackendID("overlayfs"),
+		layers: map[string]RWLayer{"snapshotter": fakeRWLayer{name: "snapshotter-layer"}},
+	}
+	legacyBackend := &fakeBackend{
+		id:     NewGraphDriverBackendID("overlayfs"),
+		layers: map[string]RWLayer{"graphdriver": fakeRWLayer{name: "graphdriver-layer"}},
+	}
+
+	router, err := NewRouter(defaultBackend)
+	assert.NilError(t, err)
+	assert.NilError(t, router.RegisterLegacy(legacyBackend))
+
+	snapshotterCtr := &ContainerRef{ID: "snapshotter", BackendID: NewContainerdSnapshotterBackendID("overlayfs")}
+	assert.NilError(t, router.RestoreLayer(snapshotterCtr))
+	assert.Check(t, is.Equal(snapshotterCtr.RWLayer, fakeRWLayer{name: "snapshotter-layer"}))
+
+	graphdriverCtr := &ContainerRef{ID: "graphdriver", BackendID: NewGraphDriverBackendID("overlayfs")}
+	assert.NilError(t, router.RestoreLayer(graphdriverCtr))
+	assert.Check(t, is.Equal(graphdriverCtr.RWLayer, fakeRWLayer{name: "graphdriver-layer"}))
 }
 
 type fakeBackend struct {

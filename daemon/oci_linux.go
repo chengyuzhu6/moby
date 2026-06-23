@@ -1043,8 +1043,8 @@ func (daemon *Daemon) createSpec(ctx context.Context, daemonCfg *configStore, c 
 	}
 
 	var snapshotter, snapshotKey string
-	if daemon.UsesSnapshotter() {
-		snapshotter = daemon.imageService.StorageDriver()
+	if daemon.containerUsesSnapshotter(c) {
+		snapshotter = daemon.containerStorageBackendID(c).Name
 		snapshotKey = c.ID
 	}
 

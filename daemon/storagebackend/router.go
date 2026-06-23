@@ -5,12 +5,51 @@ import (
 	"fmt"
 )
 
-// BackendID identifies the storage backend that owns a container's rootfs.
-//
-// For graphdrivers this is the graphdriver name, such as "overlay2" or "vfs".
-// For the containerd image store this is the snapshotter name, such as
-// "overlayfs" or "native".
-type BackendID string
+// BackendKind identifies the storage model that owns a container's rootfs.
+type BackendKind string
+
+const (
+	// BackendKindGraphDriver is a Docker graphdriver-backed container rootfs.
+	BackendKindGraphDriver BackendKind = "graphdriver"
+
+	// BackendKindContainerdSnapshotter is a containerd snapshotter-backed
+	// container rootfs.
+	BackendKindContainerdSnapshotter BackendKind = "containerd-snapshotter"
+)
+
+// BackendID identifies the storage backend that owns a container's rootfs. The
+// kind is part of the identity because graphdrivers and containerd snapshotters
+// use different metadata models and may have overlapping names.
+type BackendID struct {
+	Kind BackendKind
+	Name string
+}
+
+// NewGraphDriverBackendID returns the id for a Docker graphdriver backend.
+func NewGraphDriverBackendID(name string) BackendID {
+	return BackendID{Kind: BackendKindGraphDriver, Name: name}
+}
+
+// NewContainerdSnapshotterBackendID returns the id for a containerd snapshotter
+// backend.
+func NewContainerdSnapshotterBackendID(name string) BackendID {
+	return BackendID{Kind: BackendKindContainerdSnapshotter, Name: name}
+}
+
+func (id BackendID) String() string {
+	if id.Kind == "" {
+		return id.Name
+	}
+	if id.Name == "" {
+		return string(id.Kind)
+	}
+	return string(id.Kind) + ":" + id.Name
+}
+
+// Valid reports whether id has both a storage kind and backend name.
+func (id BackendID) Valid() bool {
+	return id.Kind != "" && id.Name != ""
+}
 
 // RWLayer is the container writable-layer surface that storage routing needs.
 //
@@ -26,9 +65,10 @@ type RWLayer interface {
 // ContainerRef contains the container metadata needed to route storage
 // operations. The daemon can adapt its full container type to this shape.
 type ContainerRef struct {
-	ID      string
-	Driver  string
-	RWLayer RWLayer
+	ID        string
+	Driver    string
+	BackendID BackendID
+	RWLayer   RWLayer
 }
 
 // ContainerStorageBackend is the minimal container-lifecycle storage surface
@@ -57,7 +97,7 @@ func NewRouter(defaultBackend ContainerStorageBackend) (*Router, error) {
 		return nil, errors.New("default storage backend is nil")
 	}
 	id := defaultBackend.BackendID()
-	if id == "" {
+	if !id.Valid() {
 		return nil, errors.New("default storage backend has empty id")
 	}
 	return &Router{
@@ -75,7 +115,7 @@ func (r *Router) RegisterLegacy(backend ContainerStorageBackend) error {
 		return errors.New("legacy storage backend is nil")
 	}
 	id := backend.BackendID()
-	if id == "" {
+	if !id.Valid() {
 		return errors.New("legacy storage backend has empty id")
 	}
 	if _, ok := r.backends[id]; ok {
@@ -101,8 +141,8 @@ func (r *Router) BackendForContainer(ctr *ContainerRef) (ContainerStorageBackend
 	if ctr == nil {
 		return nil, errors.New("container is nil")
 	}
-	id := BackendID(ctr.Driver)
-	if id == "" {
+	id := ctr.BackendID
+	if !id.Valid() {
 		id = r.defaultBackend.BackendID()
 	}
 	backend, ok := r.Lookup(id)

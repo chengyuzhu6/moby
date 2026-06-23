@@ -7,6 +7,7 @@ import (
 
 	"github.com/containerd/log"
 	"github.com/moby/moby/v2/daemon/container"
+	"github.com/moby/moby/v2/daemon/graphdriver"
 	"github.com/moby/moby/v2/daemon/internal/layer"
 	"github.com/moby/moby/v2/daemon/storagebackend"
 	"github.com/pkg/errors"
@@ -18,8 +19,37 @@ func legacyStorageBackendCompatEnabled(cfg *configStore) bool {
 	return cfg != nil && cfg.Features[legacyStorageBackendCompatFeature]
 }
 
+func (daemon *Daemon) currentStorageBackendID(driver string) storagebackend.BackendID {
+	if daemon.UsesSnapshotter() {
+		return storagebackend.NewContainerdSnapshotterBackendID(driver)
+	}
+	return storagebackend.NewGraphDriverBackendID(driver)
+}
+
+func (daemon *Daemon) containerStorageBackendID(ctr *container.Container) storagebackend.BackendID {
+	if ctr == nil || ctr.Driver == "" {
+		return daemon.currentStorageBackendID(daemon.imageService.StorageDriver())
+	}
+	if ctr.Driver == daemon.imageService.StorageDriver() {
+		return daemon.currentStorageBackendID(ctr.Driver)
+	}
+
+	// Existing container metadata only stores Driver, not the backend kind.
+	// The production-compatible subset implemented here supports graphdriver
+	// legacy containers; containerd snapshotter legacy restore must use an
+	// explicit backend kind before it can be safely enabled.
+	return storagebackend.NewGraphDriverBackendID(ctr.Driver)
+}
+
+func (daemon *Daemon) containerUsesSnapshotter(ctr *container.Container) bool {
+	return daemon.containerStorageBackendID(ctr).Kind == storagebackend.BackendKindContainerdSnapshotter
+}
+
 func (daemon *Daemon) initStorageRouter(ctx context.Context, cfg *configStore, containers map[string]map[string]*container.Container, currentDriver string) error {
-	router, err := storagebackend.NewRouter(imageServiceStorageBackend{imageService: daemon.imageService})
+	router, err := storagebackend.NewRouter(imageServiceStorageBackend{
+		id:           daemon.currentStorageBackendID(currentDriver),
+		imageService: daemon.imageService,
+	})
 	if err != nil {
 		return err
 	}
@@ -27,6 +57,9 @@ func (daemon *Daemon) initStorageRouter(ctx context.Context, cfg *configStore, c
 	for driver, driverContainers := range containers {
 		if driver == "" || driver == currentDriver || len(driverContainers) == 0 {
 			continue
+		}
+		if !graphdriver.IsRegistered(driver) {
+			return fmt.Errorf("legacy storage backend %q has %d containers but is not a registered graphdriver; containerd snapshotter legacy restore is not implemented", driver, len(driverContainers))
 		}
 
 		layerStore, err := layer.NewStoreFromOptions(layer.StoreOptions{
@@ -36,12 +69,7 @@ func (daemon *Daemon) initStorageRouter(ctx context.Context, cfg *configStore, c
 			IDMapping:          daemon.idMapping,
 		})
 		if err != nil {
-			log.G(ctx).WithFields(log.Fields{
-				"driver":    driver,
-				"container": len(driverContainers),
-				"error":     err,
-			}).Warn("legacy storage backend is not available; containers using it will be restored without RWLayer")
-			continue
+			return fmt.Errorf("failed to initialize legacy graphdriver %q for %d containers: %w", driver, len(driverContainers), err)
 		}
 
 		backend := graphdriverStorageBackend{
@@ -76,8 +104,9 @@ func (daemon *Daemon) getContainerRWLayer(ctr *container.Container) (container.R
 		return daemon.imageService.GetLayerByID(ctr.ID)
 	}
 	ref := &storagebackend.ContainerRef{
-		ID:     ctr.ID,
-		Driver: ctr.Driver,
+		ID:        ctr.ID,
+		Driver:    ctr.Driver,
+		BackendID: daemon.containerStorageBackendID(ctr),
 	}
 	if err := daemon.storageRouter.RestoreLayer(ref); err != nil {
 		return nil, err
@@ -90,9 +119,10 @@ func (daemon *Daemon) releaseContainerRWLayer(ctr *container.Container, rwLayer 
 		return daemon.imageService.ReleaseLayer(rwLayer)
 	}
 	return daemon.storageRouter.ReleaseLayer(&storagebackend.ContainerRef{
-		ID:      ctr.ID,
-		Driver:  ctr.Driver,
-		RWLayer: rwLayer,
+		ID:        ctr.ID,
+		Driver:    ctr.Driver,
+		BackendID: daemon.containerStorageBackendID(ctr),
+		RWLayer:   rwLayer,
 	})
 }
 
@@ -101,8 +131,9 @@ func (daemon *Daemon) getContainerLayerMountID(ctr *container.Container) (string
 		return daemon.imageService.GetLayerMountID(ctr.ID)
 	}
 	return daemon.storageRouter.GetLayerMountID(&storagebackend.ContainerRef{
-		ID:     ctr.ID,
-		Driver: ctr.Driver,
+		ID:        ctr.ID,
+		Driver:    ctr.Driver,
+		BackendID: daemon.containerStorageBackendID(ctr),
 	})
 }
 
@@ -114,11 +145,15 @@ func (daemon *Daemon) cleanupStorageBackends() error {
 }
 
 type imageServiceStorageBackend struct {
+	id           storagebackend.BackendID
 	imageService ImageService
 }
 
 func (b imageServiceStorageBackend) BackendID() storagebackend.BackendID {
-	return storagebackend.BackendID(b.imageService.StorageDriver())
+	if b.id.Valid() {
+		return b.id
+	}
+	return storagebackend.NewGraphDriverBackendID(b.imageService.StorageDriver())
 }
 
 func (b imageServiceStorageBackend) GetLayerByID(containerID string) (storagebackend.RWLayer, error) {
@@ -143,7 +178,7 @@ type graphdriverStorageBackend struct {
 }
 
 func (b graphdriverStorageBackend) BackendID() storagebackend.BackendID {
-	return storagebackend.BackendID(b.driverName)
+	return storagebackend.NewGraphDriverBackendID(b.driverName)
 }
 
 func (b graphdriverStorageBackend) GetLayerByID(containerID string) (storagebackend.RWLayer, error) {
