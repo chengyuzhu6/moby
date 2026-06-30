@@ -173,6 +173,7 @@ func (daemon *Daemon) SystemVersion(ctx context.Context) (system.VersionResponse
 func (daemon *Daemon) fillDriverInfo(v *system.Info) {
 	v.Driver = daemon.imageService.StorageDriver()
 	v.DriverStatus = daemon.imageService.LayerStoreStatus()
+	v.DriverStatus = append(v.DriverStatus, daemon.legacyStorageBackendStatus()...)
 	fillDriverWarnings(v)
 }
 

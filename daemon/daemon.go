@@ -1356,7 +1356,7 @@ func NewDaemon(ctx context.Context, config *config.Config, pluginStore *plugin.S
 	}
 
 	driverContainers := containers[driverName]
-	if legacyStorageBackendCompatEnabled(cfgStore) {
+	if d.legacyStorageBackendCompatEnabled(cfgStore, containers, driverName) {
 		log.G(ctx).WithField("feature", legacyStorageBackendCompatFeature).Info("legacy storage backend compatibility is enabled")
 		if err := d.initStorageRouter(ctx, cfgStore, containers, driverName); err != nil {
 			return nil, err

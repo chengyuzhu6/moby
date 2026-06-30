@@ -51,7 +51,7 @@ func (daemon *Daemon) containerInspect(daemonCfg *config.Config, ctr *container.
 		return nil, nil, err
 	}
 
-	if !daemon.UsesSnapshotter() {
+	if !daemon.containerUsesSnapshotter(ctr) {
 		if ctr.RWLayer == nil {
 			if ctr.State.Dead {
 				return base, desiredMACAddress, nil
@@ -178,7 +178,7 @@ func (daemon *Daemon) getInspectData(daemonCfg *config.Config, ctr *container.Co
 
 	inspectResponse.ImageManifestDescriptor = imageManifest
 
-	if daemon.UsesSnapshotter() {
+	if daemon.containerUsesSnapshotter(ctr) {
 		inspectResponse.Storage = &storage.Storage{
 			RootFS: &storage.RootFSStorage{
 				Snapshot: &storage.RootFSStorageSnapshot{

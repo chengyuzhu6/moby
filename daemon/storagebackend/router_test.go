@@ -141,6 +141,17 @@ func TestRouterAllowsSameBackendNameWithDifferentKinds(t *testing.T) {
 	assert.Check(t, is.Equal(graphdriverCtr.RWLayer, fakeRWLayer{name: "graphdriver-layer"}))
 }
 
+func TestRouterBackendIDs(t *testing.T) {
+	router, err := NewRouter(&fakeBackend{id: NewContainerdSnapshotterBackendID("overlayfs")})
+	assert.NilError(t, err)
+	assert.NilError(t, router.RegisterLegacy(&fakeBackend{id: NewGraphDriverBackendID("overlay2")}))
+
+	assert.Check(t, is.DeepEqual(router.BackendIDs(), []BackendID{
+		NewContainerdSnapshotterBackendID("overlayfs"),
+		NewGraphDriverBackendID("overlay2"),
+	}))
+}
+
 type fakeBackend struct {
 	id              BackendID
 	layers          map[string]RWLayer

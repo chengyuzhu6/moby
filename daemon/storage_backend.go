@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/containerd/log"
 	"github.com/moby/moby/v2/daemon/container"
@@ -15,8 +16,28 @@ import (
 
 const legacyStorageBackendCompatFeature = "legacy-storage-backend-compat"
 
-func legacyStorageBackendCompatEnabled(cfg *configStore) bool {
-	return cfg != nil && cfg.Features[legacyStorageBackendCompatFeature]
+func (daemon *Daemon) legacyStorageBackendCompatEnabled(cfg *configStore, containers map[string]map[string]*container.Container, currentDriver string) bool {
+	if cfg == nil {
+		return false
+	}
+	if enabled, ok := cfg.Features[legacyStorageBackendCompatFeature]; ok {
+		return enabled
+	}
+	if !daemon.UsesSnapshotter() {
+		return false
+	}
+
+	hasLegacyGraphdriverContainers := false
+	for driver, driverContainers := range containers {
+		if driver == "" || driver == currentDriver || len(driverContainers) == 0 {
+			continue
+		}
+		if !graphdriver.IsRegistered(driver) {
+			return false
+		}
+		hasLegacyGraphdriverContainers = true
+	}
+	return hasLegacyGraphdriverContainers
 }
 
 func (daemon *Daemon) currentStorageBackendID(driver string) storagebackend.BackendID {
@@ -43,6 +64,28 @@ func (daemon *Daemon) containerStorageBackendID(ctr *container.Container) storag
 
 func (daemon *Daemon) containerUsesSnapshotter(ctr *container.Container) bool {
 	return daemon.containerStorageBackendID(ctr).Kind == storagebackend.BackendKindContainerdSnapshotter
+}
+
+func (daemon *Daemon) legacyStorageBackendStatus() [][2]string {
+	if daemon.storageRouter == nil {
+		return nil
+	}
+
+	defaultBackend := daemon.currentStorageBackendID(daemon.imageService.StorageDriver())
+	status := [][2]string{
+		{"Default Storage Backend", defaultBackend.String()},
+	}
+	var legacy []string
+	for _, id := range daemon.storageRouter.BackendIDs() {
+		if id == defaultBackend {
+			continue
+		}
+		legacy = append(legacy, id.String())
+	}
+	if len(legacy) > 0 {
+		status = append(status, [2]string{"Legacy Storage Backends", strings.Join(legacy, ", ")})
+	}
+	return status
 }
 
 func (daemon *Daemon) initStorageRouter(ctx context.Context, cfg *configStore, containers map[string]map[string]*container.Container, currentDriver string) error {

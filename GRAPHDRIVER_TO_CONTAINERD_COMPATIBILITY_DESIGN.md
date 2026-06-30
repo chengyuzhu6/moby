@@ -29,11 +29,12 @@
 - 切换默认 backend 后，新镜像和新容器使用新的默认 backend。
 - 切换前已有的历史容器继续出现在 Docker 管理视图中。
 - 旧容器可以继续 `inspect`、`start`、`stop`、`restart`、`rm`。
+- 如果旧容器在切换期间仍保持 running，daemon 切换不应中断业务进程；新 daemon 应在 live-restore 条件满足时重新接管这些容器。
 - 不要求旧 backend 和新 backend 完整双写共存。
 
 最终方案一句话描述：
 
-> Add a restore-only compatibility path for containers created with a previous storage backend after an explicit backend switch. Image management continues to use the selected default backend.
+> Add a restore-only compatibility path for containers created with a previous storage backend after an explicit backend switch. Running legacy containers can be reconnected when live-restore/runtime state remains intact. Image management continues to use the selected default backend.
 
 ## 当前方案定位
 
@@ -46,6 +47,7 @@
 - 新 backend 是唯一默认写入后端。
 - 旧 backend 只用于切换前已经存在的容器。
 - 旧 backend 的 container RW layer 或 active snapshot 允许受限管理。
+- 对切换期间仍 running 的旧容器，兼容层只负责重新接管仍然存在的 runtime/mount/network 状态，不做热迁移。
 - 不允许通过旧 backend 创建新容器或写入新镜像。
 - 旧 backend 的 image metadata 不进入默认 image workflow；如后续展示，也只作为只读 inventory 或迁移输入。
 
@@ -325,7 +327,9 @@ daemon/delete.go
 
 当前 demo 的端到端范围是：
 
-- 支持 stopped graphdriver legacy 容器在切换到 containerd image store 后继续被 `ps/inspect/start/stop/rm` 管理。
+- 支持 graphdriver legacy 容器在切换到 containerd image store 后继续被 `ps/inspect/start/stop/rm` 管理。
+- 对切换期间保持 running 的 legacy 容器，当前 demo 可以在 live-restore/task reconnect 前提满足时重新接管，并保持业务进程不中断。
+- running reconnect 的含义是“重新接管仍存在的旧 runtime 状态”，不是把 running 容器的 rootfs、task 或 network 热迁移到新 backend。
 - `docker ps` 展示 legacy 容器时，会通过容器所属 legacy backend 的只读 image resolver 校验 image ref，避免用当前 default image store 查找失败后误退化成 image ID。
 - 不改变新建容器、pull、build、load 的 backend 选择；这些仍由当前 default `ImageService` 负责。
 - 当前没有实现完整 legacy image store 聚合；`docker images`、`docker image inspect`、`docker ps --filter ancestor=...` 等镜像视图和镜像过滤仍主要使用当前 default image store。
@@ -398,11 +402,11 @@ demo 当前处理是：`refreshImage()` 不再直接调用全局 default `imageS
 | `docker run` | 支持 | 不支持 | image 解析默认只使用 default backend |
 | `docker ps -a` | 支持 | 支持 | 聚合已恢复容器 |
 | `docker inspect <container>` | 支持 | 支持 | 按容器 backend 展示 storage 信息 |
-| `docker start` | 支持 | 支持 stopped 容器 | 按 `StorageBackendID` mount，并按容器 backend 设置 containerd metadata |
+| `docker start` | 支持 | 支持 | 按 `StorageBackendID` mount，并按容器 backend 设置 containerd metadata |
 | `docker stop` | 支持 | 支持 | 通过容器自己的 `RWLayer` unmount |
 | `docker rm` | 支持 | 支持 | 通过创建 `RWLayer` 的 backend release，不能调用 default backend release |
 | `docker logs` | 支持 | 支持 | 与 image store 弱相关 |
-| `docker exec` | 支持 | Phase 1 不承诺 | 依赖 runtime 状态、用户解析和 containerd metadata |
+| `docker exec` | 支持 | 受限支持 | running reconnect 后可用；`exec --user` 依赖 rootfs 用户解析和 backend metadata |
 | `docker diff` | 支持 | Phase 1 不承诺 | 需要 legacy backend diff/changes 能力 |
 | `docker export` | 支持 | Phase 1 不承诺 | 需要旧 rootfs mount/read 和稳定 unmount 语义 |
 | `docker commit` | 支持 | Phase 1 不承诺 | 旧容器 commit 到新后端需单独设计 |
@@ -413,7 +417,8 @@ demo 当前处理是：`refreshImage()` 不再直接调用全局 default `imageS
 
 Phase 1 的最小可交付语义应定义为：
 
-- 已停止 legacy 容器在 backend 切换后仍出现在 `docker ps -a`。
+- legacy 容器在 backend 切换后仍出现在 `docker ps -a`。
+- running legacy 容器在 live-restore/task/mount/network 状态仍存在时可被新 daemon 重新接管。
 - `docker inspect <legacy-container>` 返回清晰的 storage backend 信息。
 - `docker start/stop/restart <legacy-container>` 使用 legacy backend 的 RW layer。
 - `docker rm <legacy-container>` 只删除该容器自己的 metadata 和 RW layer，不删除 legacy image/lower layers。
@@ -421,8 +426,8 @@ Phase 1 的最小可交付语义应定义为：
 
 暂不承诺：
 
-- 对切换前正在运行的 legacy 容器做 live-restore reconnect。
 - 对 legacy 容器执行 `exec --user` 的所有语义。
+- runtime/containerd/shim 已被杀、rootfs mount 已丢失或 network sandbox 已丢失后的无损恢复。
 - legacy image 出现在普通 image 解析路径中。
 - 旧容器 `commit` 直接写入新 backend。
 
@@ -556,13 +561,14 @@ master 已经把容器按 driver 分组，但 restore 时只处理当前 `driver
 
 ## 推荐实现阶段
 
-### Phase 1: Legacy Container Restore
+### Phase 1: Legacy Container Restore and Limited Running Reconnect
 
 目标：
 
 - 新 backend 是当前显式选择的 default backend，社区主路径是 containerd image store。
 - 引入 `StorageBackendID` 和 `ContainerStorageRouter`。
-- legacy backend 只恢复切换前已经存在的 stopped 容器。
+- legacy backend 恢复切换前已经存在的容器。
+- 如果 legacy 容器在 daemon/backend 切换期间仍保持 running，并且 live-restore 所需的 runtime task、shim、rootfs mount、network sandbox 状态仍存在，新 daemon 可以重新接管该容器。
 - 支持旧容器 `ps`、`inspect`、`start`、`stop`、`restart`、`logs`、`rm`。
 - `restore`、`start`、`rm` 不再通过全局 default image service 处理 legacy RW layer。
 
@@ -572,13 +578,16 @@ master 已经把容器按 driver 分组，但 restore 时只处理当前 `driver
 - legacy image prune。
 - legacy image 参与新容器创建。
 - 多个 legacy backend。
-- running legacy 容器的 live-restore reconnect。
+- runtime/containerd/shim 被杀后的 running 状态恢复。
+- rootfs mount 或 network sandbox 已丢失后的无损恢复。
+- running 容器 rootfs 从 legacy backend 热迁移到新 backend。
 - `exec`、`diff`、`export`、`commit` 的完整兼容。
 
 退出条件：
 
-- graphdriver `overlay2` 创建 stopped 容器后，切到 containerd `overlayfs`，旧容器可以 `ps/inspect/start/stop/rm`。
-- containerd `overlayfs` 创建 stopped 容器后，切到 containerd `native`，旧容器可以通过原 snapshotter 恢复 RW layer。
+- graphdriver `overlay2` 创建容器后，切到 containerd `overlayfs`，旧容器可以 `ps/inspect/start/stop/rm`。
+- graphdriver `overlay2` 创建 running 容器并保持 live-restore 状态后，切到 containerd `overlayfs`，旧容器业务进程不中断，新 daemon 可以 `ps/logs/exec/stop/rm`。
+- containerd `overlayfs` 创建容器后，切到 containerd `native`，旧容器可以通过原 snapshotter 恢复 RW layer。
 - 删除 legacy 容器时，不删除 legacy image/lower layers，也不调用 default backend 的 release 逻辑。
 - legacy backend 初始化失败时，不静默隐藏容器。
 
@@ -703,13 +712,16 @@ master 已经把容器按 driver 分组，但 restore 时只处理当前 `driver
 
 ### Live-restore 和 running 容器
 
-running 容器比 stopped 容器复杂得多。它涉及已存在 task、rootfs mount、containerd container metadata、runtime reconnect 和网络恢复。
+running 容器比 stopped 容器复杂得多。它涉及已存在 task、rootfs mount、containerd container metadata、runtime reconnect 和网络恢复。当前 demo 可以在特定条件下重新接管 running legacy 容器，但这应被定义为受限 live-restore/reconnect，而不是任意 running 容器迁移。
 
 建议：
 
-- Phase 1 明确不支持 running legacy 容器的 backend 切换 reconnect。
-- 如果发现 legacy 容器处于 running 状态，默认应 fail-fast 或标记为 unsupported degraded，而不是尝试半恢复。
-- live-restore 支持应作为独立阶段设计和测试。
+- Phase 1 可以支持 running legacy 容器 reconnect，但必须限定在 daemon 重启期间 runtime task、shim、rootfs mount、network sandbox 均未被破坏的场景。
+- 不支持 runtime/containerd/shim 被杀后恢复 running 状态。
+- 不支持 rootfs mount 已被卸载后无损恢复 running 状态。
+- 不支持 network sandbox 丢失后的透明恢复。
+- 不支持在容器仍 running 时把 rootfs 从 legacy backend 热迁移到 default backend。
+- 如果 reconnect 前提不满足，daemon 应清晰标记 degraded/unavailable，而不是假装业务仍被完整接管。
 
 ### 安全与隔离配置
 
@@ -744,6 +756,48 @@ legacy backend 初始化不是单纯打开一个目录，还要保证 idmap、SE
 > Add a restore-only compatibility mode for containers created with the previous storage backend. New images and containers continue to use the currently configured backend.
 
 这种表述更符合上游已有讨论方向，也更容易避开“完整多后端共存”的复杂承诺。
+
+## 从 Demo 到生产级实现的差距
+
+当前 demo 已经证明以下能力技术可行：
+
+- backend 切换后恢复 legacy graphdriver 容器。
+- running legacy 容器在 live-restore 前提满足时继续保持 running，并被新 daemon 重新接管。
+- `docker ps` 的 `IMAGE` 字段通过只读 image identity resolver 保持正确展示。
+- `docker inspect` 按容器实际 backend 展示 `GraphDriver` 或 `Storage`，而不是按 daemon 当前 default backend 展示。
+- `docker info` 在兼容模式下通过 driver status 展示 default backend 和 registered legacy backends。
+- `docker rm`、mount cleanup、OCI/containerd metadata 生成按容器 backend 路由，避免误用 default backend。
+
+但生产级实现仍需要补齐以下 contract：
+
+1. **Backend identity contract**
+   - 新容器应持久化 `StorageBackendID{Kind, Name}`。
+   - 旧容器只能走 conservative inference。
+   - inference 不唯一时必须 fail-fast 或要求显式配置。
+
+2. **Opt-in 和兼容策略**
+   - 兼容模式默认不应自动启用。
+   - 用户需要显式开启，并清楚知道 daemon 将初始化 legacy backend。
+   - 是否支持 degraded mode 必须成为明确配置或明确默认策略。
+
+3. **Running reconnect contract**
+   - 只承诺 reconnect 仍存在的 runtime 状态。
+   - 不承诺恢复已经丢失的 task、mount、shim、network sandbox。
+   - 必须补集成测试覆盖 live-restore、daemon restart、backend switch 后的 `ps/logs/exec/stop/rm`。
+
+4. **User-visible status**
+   - `docker inspect` 应展示容器实际 backend 和 legacy/degraded 状态。
+   - `docker info` 应展示 default backend、registered legacy backends 和 unavailable legacy backends。
+   - 当前 demo 已展示 default/registered backend；生产级实现还需要 unavailable/degraded 状态。
+   - 不能只依赖 daemon debug log。
+
+5. **Data-safety contract**
+   - `image rm`、`system prune`、`system df` 必须明确跳过或标记 legacy backend。
+   - 删除 legacy container 只能删除自己的 RW layer，不能误删 lower layer 或 legacy image metadata。
+
+6. **Scope naming**
+   - 不应命名为 multi image store。
+   - 更准确的功能名是 `legacy storage backend container compatibility` 或 `restore-only legacy container compatibility`。
 
 ## 当前 demo 手动验证步骤
 
@@ -841,6 +895,9 @@ docker -H "unix://$SOCK" inspect new-containerd --format '{{.Driver}}'
 Phase 1 至少需要覆盖：
 
 - graphdriver daemon 创建 stopped 容器后切换到 containerd image store。
+- graphdriver daemon 创建 running 容器，在 live-restore 前提满足时切换到 containerd image store，业务进程不中断且新 daemon 可重新接管。
+- running legacy 容器 reconnect 后，`ps`、`logs`、`exec`、`stop`、`rm` 行为正确。
+- live-restore 前提不满足时，daemon 不应误报 running 容器已完整接管。
 - containerd image store 创建 stopped 容器后切换到另一个 snapshotter。
 - 旧容器 `ps`、`inspect`、`start`、`stop`、`restart`、`rm`。
 - 新容器创建，确认使用 containerd default backend。
@@ -854,7 +911,6 @@ Phase 1 至少需要覆盖：
 
 Phase 2 以后再覆盖：
 
-- graphdriver daemon 创建 running 容器，并在 live-restore 场景切换。
 - 旧 image 与新 image 同名 tag。
 - `docker image ls` 展示 legacy image 并标记 backend。
 - `docker image rm` 不误删 legacy image/layer。

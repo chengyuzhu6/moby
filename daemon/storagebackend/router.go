@@ -3,6 +3,7 @@ package storagebackend
 import (
 	"errors"
 	"fmt"
+	"slices"
 )
 
 // BackendKind identifies the storage model that owns a container's rootfs.
@@ -130,6 +131,21 @@ func (r *Router) Default() ContainerStorageBackend {
 	return r.defaultBackend
 }
 
+// BackendIDs returns all registered backend IDs in stable order.
+func (r *Router) BackendIDs() []BackendID {
+	ids := make([]BackendID, 0, len(r.backends))
+	for id := range r.backends {
+		ids = append(ids, id)
+	}
+	slices.SortFunc(ids, func(a, b BackendID) int {
+		if a.Kind != b.Kind {
+			return cmpString(string(a.Kind), string(b.Kind))
+		}
+		return cmpString(a.Name, b.Name)
+	})
+	return ids
+}
+
 // Lookup returns a registered backend by id.
 func (r *Router) Lookup(id BackendID) (ContainerStorageBackend, bool) {
 	backend, ok := r.backends[id]
@@ -199,4 +215,15 @@ func (r *Router) Cleanup() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func cmpString(a, b string) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	default:
+		return 0
+	}
 }
